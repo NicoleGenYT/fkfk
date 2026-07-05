@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket
-import asyncio
+import json
 
 app = FastAPI()
 client = None
@@ -22,10 +22,7 @@ async def ws(websocket: WebSocket):
             while True:
                 data = await websocket.receive_bytes()
                 if viewer:
-                    try:
-                        await viewer.send_bytes(data)
-                    except:
-                        viewer = None
+                    await viewer.send_bytes(data)
         except:
             client = None
             
@@ -33,11 +30,6 @@ async def ws(websocket: WebSocket):
         viewer = websocket
         try:
             while True:
-                data = await websocket.receive_bytes()
-                if client:
-                    try:
-                        await client.send_bytes(data)
-                    except:
-                        client = None
+                await websocket.receive_bytes()
         except:
             viewer = None
