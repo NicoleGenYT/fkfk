@@ -9,30 +9,42 @@ clients = {}
 viewers = {}
 client_last_ping = {}
 client_info = {}
+lock = asyncio.Lock()  # потокобезопасный доступ к словарям
 
 async def check_clients():
     while True:
         now = time.time()
-        dead = []
-        for cid, last in list(client_last_ping.items()):
-            if now - last > 20:
-                dead.append(cid)
-        for cid in dead:
-            ws = clients.pop(cid, None)
-            client_last_ping.pop(cid, None)
-            client_info.pop(cid, None)
-            if ws:
-                try:
-                    await ws.close()
-                except:
-                    pass
-            msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
-            for v in list(viewers.values()):
-                try:
-                    await v.send_bytes(msg)
-                except:
-                    pass
+        async with lock:
+            dead = [cid for cid, last in client_last_ping.items() if now - last > 20]
+            for cid in dead:
+                ws = clients.pop(cid, None)
+                client_last_ping.pop(cid, None)
+                client_info.pop(cid, None)
+                if ws:
+                    try:
+                        await ws.close()
+                    except:
+                        pass
+                # Уведомляем viewer'ов
+                msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
+                # параллельная рассылка
+                tasks = [safe_send(v, msg) for v in viewers.values()]
+                if tasks:
+                    await asyncio.gather(*tasks)
         await asyncio.sleep(5)
+
+async def safe_send(ws, data):
+    """Отправка без исключений, при ошибке удаляет viewer"""
+    try:
+        await ws.send_bytes(data)
+        return True
+    except:
+        async with lock:
+            for vid, v in list(viewers.items()):
+                if v == ws:
+                    del viewers[vid]
+                    break
+        return False
 
 @app.on_event("startup")
 async def startup():
@@ -50,48 +62,55 @@ async def ws(websocket: WebSocket):
     cid = str(uuid.uuid4())[:8]
     
     if role == "client":
-        clients[cid] = websocket
-        client_last_ping[cid] = time.time()
+        async with lock:
+            clients[cid] = websocket
+            client_last_ping[cid] = time.time()
         try:
             while True:
                 data = await websocket.receive_bytes()
-                client_last_ping[cid] = time.time()
+                async with lock:
+                    client_last_ping[cid] = time.time()
                 
                 if data == b'ping':
                     continue
                 
+                # Пытаемся распарсить JSON (инфо о системе)
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
                         msg["client_id"] = cid
-                        client_info[cid] = json.dumps(msg).encode()
+                        async with lock:
+                            client_info[cid] = json.dumps(msg).encode()
                         data = client_info[cid]
                 except:
+                    # Бинарные данные (JPEG) – добавляем префикс с длиной client_id
                     cid_bytes = cid.encode()
                     prefix = len(cid_bytes).to_bytes(2, 'big') + cid_bytes + b'|'
                     data = prefix + data
                 
-                for v in list(viewers.values()):
-                    try:
-                        await v.send_bytes(data)
-                    except:
-                        pass
+                # Параллельная рассылка всем viewer'ам
+                tasks = [safe_send(v, data) for v in viewers.values()]
+                if tasks:
+                    await asyncio.gather(*tasks)
         except:
             pass
         finally:
-            clients.pop(cid, None)
-            client_last_ping.pop(cid, None)
-            client_info.pop(cid, None)
+            async with lock:
+                clients.pop(cid, None)
+                client_last_ping.pop(cid, None)
+                client_info.pop(cid, None)
             msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
-            for v in list(viewers.values()):
-                try:
-                    await v.send_bytes(msg)
-                except:
-                    pass
+            tasks = [safe_send(v, msg) for v in viewers.values()]
+            if tasks:
+                await asyncio.gather(*tasks)
             
     elif role == "viewer":
-        viewers[cid] = websocket
-        for info_data in client_info.values():
+        async with lock:
+            viewers[cid] = websocket
+        # Отправляем новому viewer'у информацию о всех активных клиентах
+        async with lock:
+            info_list = list(client_info.values())
+        for info_data in info_list:
             try:
                 await websocket.send_bytes(info_data)
             except:
@@ -102,17 +121,21 @@ async def ws(websocket: WebSocket):
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict) and "target" in msg:
-                        target_cid = msg.pop("target")  # Убираем target из сообщения
-                        if target_cid in clients:
-                            # Пересылаем БЕЗ поля target
-                            clean_msg = json.dumps(msg).encode()
+                        target_cid = msg.pop("target")
+                        clean_msg = json.dumps(msg).encode()
+                        async with lock:
+                            target_ws = clients.get(target_cid)
+                        if target_ws:
                             try:
-                                await clients[target_cid].send_bytes(clean_msg)
+                                await target_ws.send_bytes(clean_msg)
                             except:
-                                pass
+                                async with lock:
+                                    if target_cid in clients:
+                                        del clients[target_cid]
                 except:
                     pass
         except:
             pass
         finally:
-            viewers.pop(cid, None)
+            async with lock:
+                viewers.pop(cid, None)
