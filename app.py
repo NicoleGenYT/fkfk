@@ -91,7 +91,6 @@ async def ws(websocket: WebSocket):
             
     elif role == "viewer":
         viewers[cid] = websocket
-        # Отправляем инфу о всех активных клиентах
         for info_data in client_info.values():
             try:
                 await websocket.send_bytes(info_data)
@@ -100,20 +99,15 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
-                # Пересылаем команды от viewer'а клиенту
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict) and "target" in msg:
-                        target_cid = msg["target"]
+                        target_cid = msg.pop("target")  # Убираем target из сообщения
                         if target_cid in clients:
-                            # Пересылаем настройки клиенту
-                            settings = json.dumps({
-                                "type": msg.get("type", "settings"),
-                                "quality": msg.get("quality", 40),
-                                "fps": msg.get("fps", 30)
-                            }).encode()
+                            # Пересылаем БЕЗ поля target
+                            clean_msg = json.dumps(msg).encode()
                             try:
-                                await clients[target_cid].send_bytes(settings)
+                                await clients[target_cid].send_bytes(clean_msg)
                             except:
                                 pass
                 except:
