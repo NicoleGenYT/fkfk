@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket
 import asyncio
 import time
 import json
+import struct
 
 app = FastAPI()
 clients = {}
@@ -57,7 +58,9 @@ async def ws(websocket: WebSocket):
                             msg["client_id"] = cid
                             data = json.dumps(msg).encode()
                     except:
-                        pass  # Не JSON — бинарные данные (кадр), не трогаем
+                        # Бинарные данные (JPEG) — добавляем префикс с client_id
+                        prefix = cid.encode() + b'|'
+                        data = prefix + data
                     
                     for v in list(viewers.values()):
                         try:
