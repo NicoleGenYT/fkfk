@@ -5,10 +5,10 @@ import json
 import uuid
 
 app = FastAPI()
-clients = {}           # cid -> websocket
-viewers = {}           # cid -> websocket
-client_last_ping = {}  # cid -> timestamp
-client_info = {}       # cid -> info_bytes (последнее info-сообщение клиента)
+clients = {}
+viewers = {}
+client_last_ping = {}
+client_info = {}
 
 async def check_clients():
     while True:
@@ -26,7 +26,6 @@ async def check_clients():
                     await ws.close()
                 except:
                     pass
-            # Уведомляем viewer'ов
             msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
             for v in list(viewers.values()):
                 try:
@@ -48,7 +47,7 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     
     role = websocket.query_params.get("role", "")
-    cid = str(uuid.uuid4())[:8]  # Уникальный короткий ID
+    cid = str(uuid.uuid4())[:8]
     
     if role == "client":
         clients[cid] = websocket
@@ -56,26 +55,22 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
-                client_last_ping[cid] = time.time()  # любое данное обновляет таймер
+                client_last_ping[cid] = time.time()
                 
                 if data == b'ping':
-                    continue  # пинг не пересылаем
+                    continue
                 
-                # Пытаемся распарсить JSON (инфо о системе)
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
                         msg["client_id"] = cid
-                        # Сохраняем info для отправки новым viewer'ам
                         client_info[cid] = json.dumps(msg).encode()
                         data = client_info[cid]
                 except:
-                    # Бинарные данные (JPEG) – добавляем префикс с длиной client_id
                     cid_bytes = cid.encode()
                     prefix = len(cid_bytes).to_bytes(2, 'big') + cid_bytes + b'|'
                     data = prefix + data
                 
-                # Рассылаем всем viewer'ам
                 for v in list(viewers.values()):
                     try:
                         await v.send_bytes(data)
@@ -87,7 +82,6 @@ async def ws(websocket: WebSocket):
             clients.pop(cid, None)
             client_last_ping.pop(cid, None)
             client_info.pop(cid, None)
-            # Уведомляем viewer'ов об отключении
             msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
             for v in list(viewers.values()):
                 try:
@@ -97,7 +91,7 @@ async def ws(websocket: WebSocket):
             
     elif role == "viewer":
         viewers[cid] = websocket
-        # Отправляем новому viewer'у информацию о всех активных клиентах
+        # Отправляем инфу о всех активных клиентах
         for info_data in client_info.values():
             try:
                 await websocket.send_bytes(info_data)
@@ -105,7 +99,25 @@ async def ws(websocket: WebSocket):
                 pass
         try:
             while True:
-                await websocket.receive_bytes()  # viewer может слать команды, пока просто читаем
+                data = await websocket.receive_bytes()
+                # Пересылаем команды от viewer'а клиенту
+                try:
+                    msg = json.loads(data.decode())
+                    if isinstance(msg, dict) and "target" in msg:
+                        target_cid = msg["target"]
+                        if target_cid in clients:
+                            # Пересылаем настройки клиенту
+                            settings = json.dumps({
+                                "type": msg.get("type", "settings"),
+                                "quality": msg.get("quality", 40),
+                                "fps": msg.get("fps", 30)
+                            }).encode()
+                            try:
+                                await clients[target_cid].send_bytes(settings)
+                            except:
+                                pass
+                except:
+                    pass
         except:
             pass
         finally:
