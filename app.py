@@ -2,7 +2,6 @@ from fastapi import FastAPI, WebSocket
 import asyncio
 import time
 import json
-import struct
 
 app = FastAPI()
 clients = {}
@@ -11,9 +10,10 @@ client_last_ping = {}
 
 async def check_clients():
     while True:
+        now = time.time()
         dead = []
-        for cid, ws in list(clients.items()):
-            if time.time() - client_last_ping.get(cid, 0) > 20:
+        for cid, last in list(client_last_ping.items()):
+            if now - last > 20:
                 dead.append(cid)
         for cid in dead:
             if cid in clients:
@@ -48,25 +48,28 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
+                # Обновляем время при ЛЮБЫХ данных
+                client_last_ping[cid] = time.time()
+                
                 if data == b'ping':
-                    client_last_ping[cid] = time.time()
-                else:
-                    # Пытаемся распарсить JSON и добавить client_id
+                    continue  # Не пересылаем пинг viewer'у
+                
+                # Пытаемся распарсить JSON и добавить client_id
+                try:
+                    msg = json.loads(data.decode())
+                    if isinstance(msg, dict):
+                        msg["client_id"] = cid
+                        data = json.dumps(msg).encode()
+                except:
+                    # Бинарные данные (JPEG) — добавляем префикс с client_id
+                    prefix = cid.encode() + b'|'
+                    data = prefix + data
+                
+                for v in list(viewers.values()):
                     try:
-                        msg = json.loads(data.decode())
-                        if isinstance(msg, dict):
-                            msg["client_id"] = cid
-                            data = json.dumps(msg).encode()
+                        await v.send_bytes(data)
                     except:
-                        # Бинарные данные (JPEG) — добавляем префикс с client_id
-                        prefix = cid.encode() + b'|'
-                        data = prefix + data
-                    
-                    for v in list(viewers.values()):
-                        try:
-                            await v.send_bytes(data)
-                        except:
-                            pass
+                        pass
         except:
             if cid in clients:
                 del clients[cid]
