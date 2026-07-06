@@ -1,28 +1,36 @@
 from fastapi import FastAPI, WebSocket
 import asyncio
 import time
+import json
 
 app = FastAPI()
-client = None
-viewer = None
-last_ping = 0
+clients = {}  # client_id -> websocket
+viewers = {}  # viewer_id -> websocket
+client_last_ping = {}  # client_id -> timestamp
 
-async def check_client():
-    global client, last_ping, viewer
+async def check_clients():
+    global clients, client_last_ping, viewers
     while True:
-        if client and time.time() - last_ping > 20:
-            # Клиент не пинговал 20 секунд - считаем мёртвым
-            if viewer:
-                try:
-                    await viewer.send_bytes(b'{"type":"disconnect"}')
-                except:
-                    pass
-            client = None
+        dead = []
+        for cid, ws in clients.items():
+            if time.time() - client_last_ping.get(cid, 0) > 20:
+                dead.append(cid)
+                # Уведомляем всех viewer'ов
+                for v in viewers.values():
+                    try:
+                        await v.send_bytes(json.dumps({"type": "disconnect", "client_id": cid}).encode())
+                    except:
+                        pass
+        for cid in dead:
+            if cid in clients:
+                del clients[cid]
+            if cid in client_last_ping:
+                del client_last_ping[cid]
         await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(check_client())
+    asyncio.create_task(check_clients())
 
 @app.get("/")
 def index():
@@ -30,33 +38,43 @@ def index():
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
-    global client, viewer, last_ping
+    global clients, viewers, client_last_ping
     await websocket.accept()
     
     role = websocket.query_params.get("role", "")
+    cid = str(id(websocket))
     
     if role == "client":
-        client = websocket
-        last_ping = time.time()
+        clients[cid] = websocket
+        client_last_ping[cid] = time.time()
         try:
             while True:
                 data = await websocket.receive_bytes()
                 if data == b'ping':
-                    last_ping = time.time()
-                elif viewer:
-                    await viewer.send_bytes(data)
+                    client_last_ping[cid] = time.time()
+                else:
+                    # Пересылаем всем viewer'ам
+                    for v in viewers.values():
+                        try:
+                            await v.send_bytes(data)
+                        except:
+                            pass
         except:
-            if viewer:
+            if cid in clients:
+                del clients[cid]
+            if cid in client_last_ping:
+                del client_last_ping[cid]
+            for v in viewers.values():
                 try:
-                    await viewer.send_bytes(b'{"type":"disconnect"}')
+                    await v.send_bytes(json.dumps({"type": "disconnect", "client_id": cid}).encode())
                 except:
                     pass
-            client = None
             
     elif role == "viewer":
-        viewer = websocket
+        viewers[cid] = websocket
         try:
             while True:
-                data = await websocket.receive_bytes()
+                await websocket.receive_bytes()
         except:
-            viewer = None
+            if cid in viewers:
+                del viewers[cid]
