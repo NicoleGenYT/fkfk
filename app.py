@@ -4,28 +4,26 @@ import time
 import json
 
 app = FastAPI()
-clients = {}  # client_id -> websocket
-viewers = {}  # viewer_id -> websocket
-client_last_ping = {}  # client_id -> timestamp
+clients = {}
+viewers = {}
+client_last_ping = {}
 
 async def check_clients():
-    global clients, client_last_ping, viewers
     while True:
         dead = []
-        for cid, ws in clients.items():
+        for cid, ws in list(clients.items()):
             if time.time() - client_last_ping.get(cid, 0) > 20:
                 dead.append(cid)
-                # Уведомляем всех viewer'ов
-                for v in viewers.values():
-                    try:
-                        await v.send_bytes(json.dumps({"type": "disconnect", "client_id": cid}).encode())
-                    except:
-                        pass
         for cid in dead:
             if cid in clients:
                 del clients[cid]
             if cid in client_last_ping:
                 del client_last_ping[cid]
+            for v in list(viewers.values()):
+                try:
+                    await v.send_bytes(json.dumps({"type": "disconnect", "client_id": cid}).encode())
+                except:
+                    pass
         await asyncio.sleep(5)
 
 @app.on_event("startup")
@@ -38,11 +36,10 @@ def index():
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
-    global clients, viewers, client_last_ping
     await websocket.accept()
     
     role = websocket.query_params.get("role", "")
-    cid = str(id(websocket))
+    cid = str(id(websocket))[:8]
     
     if role == "client":
         clients[cid] = websocket
@@ -53,8 +50,16 @@ async def ws(websocket: WebSocket):
                 if data == b'ping':
                     client_last_ping[cid] = time.time()
                 else:
-                    # Пересылаем всем viewer'ам
-                    for v in viewers.values():
+                    # Пытаемся распарсить JSON и добавить client_id
+                    try:
+                        msg = json.loads(data.decode())
+                        if isinstance(msg, dict):
+                            msg["client_id"] = cid
+                            data = json.dumps(msg).encode()
+                    except:
+                        pass  # Не JSON — бинарные данные (кадр), не трогаем
+                    
+                    for v in list(viewers.values()):
                         try:
                             await v.send_bytes(data)
                         except:
@@ -64,7 +69,7 @@ async def ws(websocket: WebSocket):
                 del clients[cid]
             if cid in client_last_ping:
                 del client_last_ping[cid]
-            for v in viewers.values():
+            for v in list(viewers.values()):
                 try:
                     await v.send_bytes(json.dumps({"type": "disconnect", "client_id": cid}).encode())
                 except:
