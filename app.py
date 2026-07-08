@@ -1,4 +1,3 @@
-# server.py
 from fastapi import FastAPI, WebSocket
 import asyncio
 import time
@@ -102,6 +101,7 @@ async def ws(websocket: WebSocket):
     elif role == "viewer":
         async with lock:
             viewers[cid] = websocket
+        # Отправляем начальный список
         async with lock:
             info_list = list(client_info.values())
         for info_data in info_list:
@@ -112,20 +112,33 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
+                # Проверяем JSON-команды от вьювера
                 try:
                     msg = json.loads(data.decode())
-                    if isinstance(msg, dict) and "target" in msg:
-                        target_cid = msg.pop("target")
-                        clean_msg = json.dumps(msg).encode()
-                        async with lock:
-                            target_ws = clients.get(target_cid)
-                        if target_ws:
-                            try:
-                                await target_ws.send_bytes(clean_msg)
-                            except:
-                                async with lock:
-                                    if target_cid in clients:
-                                        del clients[target_cid]
+                    if isinstance(msg, dict):
+                        # Новая команда: запрос списка клиентов
+                        if msg.get("type") == "get_clients":
+                            async with lock:
+                                info_list = list(client_info.values())
+                            for info_data in info_list:
+                                try:
+                                    await websocket.send_bytes(info_data)
+                                except:
+                                    break
+                            continue
+                        # Пересылка команды конкретному клиенту
+                        if "target" in msg:
+                            target_cid = msg.pop("target")
+                            clean_msg = json.dumps(msg).encode()
+                            async with lock:
+                                target_ws = clients.get(target_cid)
+                            if target_ws:
+                                try:
+                                    await target_ws.send_bytes(clean_msg)
+                                except:
+                                    async with lock:
+                                        if target_cid in clients:
+                                            del clients[target_cid]
                 except:
                     pass
         except:
