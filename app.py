@@ -1,3 +1,4 @@
+# server.py
 from fastapi import FastAPI, WebSocket
 import asyncio
 import time
@@ -9,7 +10,7 @@ clients = {}
 viewers = {}
 client_last_ping = {}
 client_info = {}
-lock = asyncio.Lock()  # потокобезопасный доступ к словарям
+lock = asyncio.Lock()
 
 async def check_clients():
     while True:
@@ -25,16 +26,13 @@ async def check_clients():
                         await ws.close()
                     except:
                         pass
-                # Уведомляем viewer'ов
                 msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
-                # параллельная рассылка
                 tasks = [safe_send(v, msg) for v in viewers.values()]
                 if tasks:
                     await asyncio.gather(*tasks)
         await asyncio.sleep(5)
 
 async def safe_send(ws, data):
-    """Отправка без исключений, при ошибке удаляет viewer"""
     try:
         await ws.send_bytes(data)
         return True
@@ -74,7 +72,6 @@ async def ws(websocket: WebSocket):
                 if data == b'ping':
                     continue
                 
-                # Пытаемся распарсить JSON (инфо о системе)
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
@@ -83,12 +80,10 @@ async def ws(websocket: WebSocket):
                             client_info[cid] = json.dumps(msg).encode()
                         data = client_info[cid]
                 except:
-                    # Бинарные данные (JPEG) – добавляем префикс с длиной client_id
                     cid_bytes = cid.encode()
                     prefix = len(cid_bytes).to_bytes(2, 'big') + cid_bytes + b'|'
                     data = prefix + data
                 
-                # Параллельная рассылка всем viewer'ам
                 tasks = [safe_send(v, data) for v in viewers.values()]
                 if tasks:
                     await asyncio.gather(*tasks)
@@ -107,7 +102,6 @@ async def ws(websocket: WebSocket):
     elif role == "viewer":
         async with lock:
             viewers[cid] = websocket
-        # Отправляем новому viewer'у информацию о всех активных клиентах
         async with lock:
             info_list = list(client_info.values())
         for info_data in info_list:
