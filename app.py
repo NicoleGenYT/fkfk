@@ -2,30 +2,31 @@ from fastapi import FastAPI, WebSocket
 import asyncio
 import time
 import json
-import uuid
 
 app = FastAPI()
-clients = {}
-viewers = {}
-client_last_ping = {}
-client_info = {}
+
+# Ключ – hwid клиента
+clients = {}          # hwid -> websocket
+viewers = {}          # viewer_id -> websocket
+client_last_ping = {} # hwid -> timestamp
+client_info = {}      # hwid -> bytes (последнее info-сообщение в JSON)
 lock = asyncio.Lock()
 
 async def check_clients():
     while True:
         now = time.time()
         async with lock:
-            dead = [cid for cid, last in client_last_ping.items() if now - last > 20]
-            for cid in dead:
-                ws = clients.pop(cid, None)
-                client_last_ping.pop(cid, None)
-                client_info.pop(cid, None)
+            dead = [hwid for hwid, last in client_last_ping.items() if now - last > 20]
+            for hwid in dead:
+                ws = clients.pop(hwid, None)
+                client_last_ping.pop(hwid, None)
+                client_info.pop(hwid, None)
                 if ws:
                     try:
                         await ws.close()
                     except:
                         pass
-                msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
+                msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
                 tasks = [safe_send(v, msg) for v in viewers.values()]
                 if tasks:
                     await asyncio.gather(*tasks)
@@ -56,52 +57,66 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     
     role = websocket.query_params.get("role", "")
-    cid = str(uuid.uuid4())[:8]
+    vid = str(id(websocket))  # уникальный ID для вьювера (не важен)
     
     if role == "client":
-        async with lock:
-            clients[cid] = websocket
-            client_last_ping[cid] = time.time()
+        hwid = None
         try:
             while True:
                 data = await websocket.receive_bytes()
-                async with lock:
-                    client_last_ping[cid] = time.time()
                 
-                if data == b'ping':
-                    continue
-                
+                # Попытка распарсить JSON – чтобы извлечь hwid и сохранить info
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
-                        msg["client_id"] = cid
-                        async with lock:
-                            client_info[cid] = json.dumps(msg).encode()
-                        data = client_info[cid]
+                        # Сохраняем hwid при первом info-сообщении
+                        if msg.get("type") == "info":
+                            hwid = msg.get("hwid", "")
+                            if hwid:
+                                async with lock:
+                                    clients[hwid] = websocket
+                                    client_last_ping[hwid] = time.time()
+                                    client_info[hwid] = data
+                                # Рассылаем вьюверам
+                                tasks = [safe_send(v, data) for v in viewers.values()]
+                                if tasks:
+                                    await asyncio.gather(*tasks)
+                                continue
+                        # Другие JSON-сообщения (audio_devices_list, audio_error и т.д.)
+                        if hwid:
+                            async with lock:
+                                client_last_ping[hwid] = time.time()
+                            tasks = [safe_send(v, data) for v in viewers.values()]
+                            if tasks:
+                                await asyncio.gather(*tasks)
+                        continue
                 except:
-                    cid_bytes = cid.encode()
-                    prefix = len(cid_bytes).to_bytes(2, 'big') + cid_bytes + b'|'
-                    data = prefix + data
-                
-                tasks = [safe_send(v, data) for v in viewers.values()]
-                if tasks:
-                    await asyncio.gather(*tasks)
+                    pass
+
+                # Бинарные данные (видео, аудио) – передаём как есть
+                if hwid:
+                    async with lock:
+                        client_last_ping[hwid] = time.time()
+                    tasks = [safe_send(v, data) for v in viewers.values()]
+                    if tasks:
+                        await asyncio.gather(*tasks)
         except:
             pass
         finally:
-            async with lock:
-                clients.pop(cid, None)
-                client_last_ping.pop(cid, None)
-                client_info.pop(cid, None)
-            msg = json.dumps({"type": "disconnect", "client_id": cid}).encode()
-            tasks = [safe_send(v, msg) for v in viewers.values()]
-            if tasks:
-                await asyncio.gather(*tasks)
+            if hwid:
+                async with lock:
+                    clients.pop(hwid, None)
+                    client_last_ping.pop(hwid, None)
+                    client_info.pop(hwid, None)
+                msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
+                tasks = [safe_send(v, msg) for v in viewers.values()]
+                if tasks:
+                    await asyncio.gather(*tasks)
             
     elif role == "viewer":
         async with lock:
-            viewers[cid] = websocket
-        # Отправляем начальный список
+            viewers[vid] = websocket
+        # Отправить все сохранённые info-сообщения
         async with lock:
             info_list = list(client_info.values())
         for info_data in info_list:
@@ -112,37 +127,37 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
-                # Проверяем JSON-команды от вьювера
+                # Команды от вьювера (могут быть JSON с target)
                 try:
                     msg = json.loads(data.decode())
-                    if isinstance(msg, dict):
-                        # Новая команда: запрос списка клиентов
-                        if msg.get("type") == "get_clients":
-                            async with lock:
-                                info_list = list(client_info.values())
-                            for info_data in info_list:
-                                try:
-                                    await websocket.send_bytes(info_data)
-                                except:
-                                    break
-                            continue
-                        # Пересылка команды конкретному клиенту
-                        if "target" in msg:
-                            target_cid = msg.pop("target")
-                            clean_msg = json.dumps(msg).encode()
-                            async with lock:
-                                target_ws = clients.get(target_cid)
-                            if target_ws:
-                                try:
-                                    await target_ws.send_bytes(clean_msg)
-                                except:
-                                    async with lock:
-                                        if target_cid in clients:
-                                            del clients[target_cid]
+                    if msg.get("type") == "get_clients":
+                        # Повторно отправляем все info
+                        async with lock:
+                            info_list = list(client_info.values())
+                        for info_data in info_list:
+                            try:
+                                await websocket.send_bytes(info_data)
+                            except:
+                                break
+                        continue
+                    # Пересылка команды конкретному клиенту по hwid
+                    target_hwid = msg.get("target")
+                    if target_hwid:
+                        async with lock:
+                            target_ws = clients.get(target_hwid)
+                        if target_ws:
+                            try:
+                                # Убираем target перед отправкой, чтобы клиент не смущался
+                                del msg["target"]
+                                await target_ws.send_bytes(json.dumps(msg).encode())
+                            except:
+                                async with lock:
+                                    if target_hwid in clients:
+                                        del clients[target_hwid]
                 except:
                     pass
         except:
             pass
         finally:
             async with lock:
-                viewers.pop(cid, None)
+                viewers.pop(vid, None)
