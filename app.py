@@ -1,3 +1,4 @@
+# ==================== СЕРВЕРНАЯ ЧАСТЬ (ИСПРАВЛЕНО) ====================
 from fastapi import FastAPI, WebSocket
 import asyncio
 import time
