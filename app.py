@@ -1,4 +1,4 @@
-# ==================== СЕРВЕРНАЯ ЧАСТЬ (ИСПРАВЛЕНО) ====================
+# ==================== СЕРВЕРНАЯ ЧАСТЬ ====================
 from fastapi import FastAPI, WebSocket
 import asyncio
 import time
@@ -67,6 +67,11 @@ async def ws(websocket: WebSocket):
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
+                        # Обработка ping
+                        if msg.get("type") == "ping":
+                            await websocket.send_bytes(json.dumps({"type": "pong"}).encode())
+                            continue
+                        
                         if msg.get("type") == "info":
                             hwid = msg.get("hwid", "")
                             if hwid:
@@ -141,7 +146,7 @@ async def ws(websocket: WebSocket):
                                 await target_ws.send_bytes(json.dumps(msg).encode())
                             except:
                                 async with lock:
-                                    if target_hwid in clients:   # ИСПРАВЛЕНО: была опечатка 'cагlients'
+                                    if target_hwid in clients:
                                         del clients[target_hwid]
                 except:
                     pass
@@ -150,4 +155,3 @@ async def ws(websocket: WebSocket):
         finally:
             async with lock:
                 viewers.pop(vid, None)
-                
