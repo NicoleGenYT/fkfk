@@ -11,13 +11,30 @@ viewers = {}          # viewer_id -> websocket
 client_last_ping = {} # hwid -> timestamp
 client_info = {}      # hwid -> bytes (последнее info-сообщение в JSON)
 lock = asyncio.Lock()
+dead_viewers = set()  # Отложенное удаление вьюверов
+
+async def cleanup_dead_viewers():
+    """Удаляет мёртвых вьюверов без блокировок"""
+    async with lock:
+        for vid in list(dead_viewers):
+            viewers.pop(vid, None)
+        dead_viewers.clear()
+
+async def safe_send(ws, data):
+    """Безопасная отправка без повторного захвата lock"""
+    try:
+        await ws.send_bytes(data)
+        return True
+    except:
+        return False
 
 async def check_clients():
     while True:
         now = time.time()
+        dead_clients = []
         async with lock:
-            dead = [hwid for hwid, last in client_last_ping.items() if now - last > 20]
-            for hwid in dead:
+            dead_clients = [hwid for hwid, last in client_last_ping.items() if now - last > 20]
+            for hwid in dead_clients:
                 ws = clients.pop(hwid, None)
                 client_last_ping.pop(hwid, None)
                 client_info.pop(hwid, None)
@@ -26,23 +43,17 @@ async def check_clients():
                         await ws.close()
                     except:
                         pass
-                msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
-                tasks = [safe_send(v, msg) for v in viewers.values()]
-                if tasks:
-                    await asyncio.gather(*tasks)
+        # Отправляем уведомления о отключении БЕЗ блокировки
+        if dead_clients:
+            msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
+            tasks = []
+            async with lock:
+                for v in viewers.values():
+                    tasks.append(safe_send(v, msg))
+            if tasks:
+                await asyncio.gather(*tasks)
+        await cleanup_dead_viewers()
         await asyncio.sleep(5)
-
-async def safe_send(ws, data):
-    try:
-        await ws.send_bytes(data)
-        return True
-    except:
-        async with lock:
-            for vid, v in list(viewers.items()):
-                if v == ws:
-                    del viewers[vid]
-                    break
-        return False
 
 @app.on_event("startup")
 async def startup():
@@ -64,9 +75,13 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
+                
+                # Попытка распарсить JSON (для команд)
+                is_json = False
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
+                        is_json = True
                         # Обработка ping
                         if msg.get("type") == "ping":
                             await websocket.send_bytes(json.dumps({"type": "pong"}).encode())
@@ -79,24 +94,25 @@ async def ws(websocket: WebSocket):
                                     clients[hwid] = websocket
                                     client_last_ping[hwid] = time.time()
                                     client_info[hwid] = data
-                                tasks = [safe_send(v, data) for v in viewers.values()]
+                                # Рассылаем info всем вьюверам
+                                tasks = []
+                                async with lock:
+                                    for v in viewers.values():
+                                        tasks.append(safe_send(v, data))
                                 if tasks:
                                     await asyncio.gather(*tasks)
                                 continue
-                        if hwid:
-                            async with lock:
-                                client_last_ping[hwid] = time.time()
-                            tasks = [safe_send(v, data) for v in viewers.values()]
-                            if tasks:
-                                await asyncio.gather(*tasks)
-                        continue
                 except:
                     pass
-
+                
+                # Для всех остальных данных (включая бинарные) - рассылаем всем вьюверам
                 if hwid:
                     async with lock:
                         client_last_ping[hwid] = time.time()
-                    tasks = [safe_send(v, data) for v in viewers.values()]
+                    tasks = []
+                    async with lock:
+                        for v in viewers.values():
+                            tasks.append(safe_send(v, data))
                     if tasks:
                         await asyncio.gather(*tasks)
         except:
@@ -108,26 +124,32 @@ async def ws(websocket: WebSocket):
                     client_last_ping.pop(hwid, None)
                     client_info.pop(hwid, None)
                 msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
-                tasks = [safe_send(v, msg) for v in viewers.values()]
+                tasks = []
+                async with lock:
+                    for v in viewers.values():
+                        tasks.append(safe_send(v, msg))
                 if tasks:
                     await asyncio.gather(*tasks)
             
     elif role == "viewer":
         async with lock:
             viewers[vid] = websocket
+        # Отправляем существующие info
+        info_list = []
         async with lock:
             info_list = list(client_info.values())
         for info_data in info_list:
             try:
                 await websocket.send_bytes(info_data)
             except:
-                pass
+                break
         try:
             while True:
                 data = await websocket.receive_bytes()
                 try:
                     msg = json.loads(data.decode())
                     if msg.get("type") == "get_clients":
+                        info_list = []
                         async with lock:
                             info_list = list(client_info.values())
                         for info_data in info_list:
@@ -138,6 +160,7 @@ async def ws(websocket: WebSocket):
                         continue
                     target_hwid = msg.get("target")
                     if target_hwid:
+                        target_ws = None
                         async with lock:
                             target_ws = clients.get(target_hwid)
                         if target_ws:
