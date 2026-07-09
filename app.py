@@ -150,3 +150,4 @@ async def ws(websocket: WebSocket):
         finally:
             async with lock:
                 viewers.pop(vid, None)
+                
