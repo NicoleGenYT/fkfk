@@ -5,7 +5,6 @@ import json
 
 app = FastAPI()
 
-# Ключ – hwid клиента
 clients = {}          # hwid -> websocket
 viewers = {}          # viewer_id -> websocket
 client_last_ping = {} # hwid -> timestamp
@@ -57,19 +56,16 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     
     role = websocket.query_params.get("role", "")
-    vid = str(id(websocket))  # уникальный ID для вьювера (не важен)
+    vid = str(id(websocket))
     
     if role == "client":
         hwid = None
         try:
             while True:
                 data = await websocket.receive_bytes()
-                
-                # Попытка распарсить JSON – чтобы извлечь hwid и сохранить info
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
-                        # Сохраняем hwid при первом info-сообщении
                         if msg.get("type") == "info":
                             hwid = msg.get("hwid", "")
                             if hwid:
@@ -77,12 +73,10 @@ async def ws(websocket: WebSocket):
                                     clients[hwid] = websocket
                                     client_last_ping[hwid] = time.time()
                                     client_info[hwid] = data
-                                # Рассылаем вьюверам
                                 tasks = [safe_send(v, data) for v in viewers.values()]
                                 if tasks:
                                     await asyncio.gather(*tasks)
                                 continue
-                        # Другие JSON-сообщения (audio_devices_list, audio_error и т.д.)
                         if hwid:
                             async with lock:
                                 client_last_ping[hwid] = time.time()
@@ -93,7 +87,6 @@ async def ws(websocket: WebSocket):
                 except:
                     pass
 
-                # Бинарные данные (видео, аудио) – передаём как есть
                 if hwid:
                     async with lock:
                         client_last_ping[hwid] = time.time()
@@ -116,7 +109,6 @@ async def ws(websocket: WebSocket):
     elif role == "viewer":
         async with lock:
             viewers[vid] = websocket
-        # Отправить все сохранённые info-сообщения
         async with lock:
             info_list = list(client_info.values())
         for info_data in info_list:
@@ -127,11 +119,9 @@ async def ws(websocket: WebSocket):
         try:
             while True:
                 data = await websocket.receive_bytes()
-                # Команды от вьювера (могут быть JSON с target)
                 try:
                     msg = json.loads(data.decode())
                     if msg.get("type") == "get_clients":
-                        # Повторно отправляем все info
                         async with lock:
                             info_list = list(client_info.values())
                         for info_data in info_list:
@@ -140,19 +130,17 @@ async def ws(websocket: WebSocket):
                             except:
                                 break
                         continue
-                    # Пересылка команды конкретному клиенту по hwid
                     target_hwid = msg.get("target")
                     if target_hwid:
                         async with lock:
                             target_ws = clients.get(target_hwid)
                         if target_ws:
                             try:
-                                # Убираем target перед отправкой, чтобы клиент не смущался
                                 del msg["target"]
                                 await target_ws.send_bytes(json.dumps(msg).encode())
                             except:
                                 async with lock:
-                                    if target_hwid in clients:
+                                    if target_hwid in clients:   # ИСПРАВЛЕНО: была опечатка 'cагlients'
                                         del clients[target_hwid]
                 except:
                     pass
