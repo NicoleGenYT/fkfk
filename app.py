@@ -3,8 +3,7 @@ from fastapi import FastAPI, WebSocket
 import asyncio
 import time
 import json
-
-app = FastAPI()
+from contextlib import asynccontextmanager
 
 clients = {}          # hwid -> websocket
 viewers = {}          # viewer_id -> websocket
@@ -28,36 +27,55 @@ async def safe_send(ws, data):
     except:
         return False
 
+async def notify_disconnect(hwid):
+    """Безопасно уведомляет всех подключенных вьюверов об отключении клиента"""
+    msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
+    async with lock:
+        viewers_list = list(viewers.values())
+    
+    tasks = [safe_send(v, msg) for v in viewers_list]
+    if tasks:
+        await asyncio.gather(*tasks)
+
 async def check_clients():
     while True:
-        now = time.time()
-        dead_clients = []
-        async with lock:
-            dead_clients = [hwid for hwid, last in client_last_ping.items() if now - last > 20]
-            for hwid in dead_clients:
-                ws = clients.pop(hwid, None)
-                client_last_ping.pop(hwid, None)
-                client_info.pop(hwid, None)
-                if ws:
-                    try:
-                        await ws.close()
-                    except:
-                        pass
-        # Отправляем уведомления о отключении БЕЗ блокировки
-        if dead_clients:
-            msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
-            tasks = []
+        try:
+            now = time.time()
+            dead_clients = []
             async with lock:
-                for v in viewers.values():
-                    tasks.append(safe_send(v, msg))
-            if tasks:
-                await asyncio.gather(*tasks)
-        await cleanup_dead_viewers()
+                dead_clients = [hwid for hwid, last in client_last_ping.items() if now - last > 20]
+                for hwid in dead_clients:
+                    ws = clients.pop(hwid, None)
+                    client_last_ping.pop(hwid, None)
+                    client_info.pop(hwid, None)
+                    if ws:
+                        try:
+                            await ws.close()
+                        except:
+                            pass
+            
+            # ИСПРАВЛЕНО: Отправляем уведомления циклом по каждому мертвому клиенту
+            if dead_clients:
+                for hwid in dead_clients:
+                    await notify_disconnect(hwid)
+                    
+            await cleanup_dead_viewers()
+        except asyncio.CancelledError:
+            break
+        except:
+            pass
         await asyncio.sleep(5)
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(check_clients())
+# ИСПРАВЛЕНО: Вместо устаревшего @app.on_event("startup") используется lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Запуск фоновой задачи проверки пингов
+    task = asyncio.create_task(check_clients())
+    yield
+    # Корректное завершение задачи при остановке сервера
+    task.cancel()
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def index():
@@ -77,11 +95,9 @@ async def ws(websocket: WebSocket):
                 data = await websocket.receive_bytes()
                 
                 # Попытка распарсить JSON (для команд)
-                is_json = False
                 try:
                     msg = json.loads(data.decode())
                     if isinstance(msg, dict):
-                        is_json = True
                         # Обработка ping
                         if msg.get("type") == "ping":
                             await websocket.send_bytes(json.dumps({"type": "pong"}).encode())
@@ -94,11 +110,10 @@ async def ws(websocket: WebSocket):
                                     clients[hwid] = websocket
                                     client_last_ping[hwid] = time.time()
                                     client_info[hwid] = data
+                                    viewers_list = list(viewers.values())
+                                
                                 # Рассылаем info всем вьюверам
-                                tasks = []
-                                async with lock:
-                                    for v in viewers.values():
-                                        tasks.append(safe_send(v, data))
+                                tasks = [safe_send(v, data) for v in viewers_list]
                                 if tasks:
                                     await asyncio.gather(*tasks)
                                 continue
@@ -109,10 +124,9 @@ async def ws(websocket: WebSocket):
                 if hwid:
                     async with lock:
                         client_last_ping[hwid] = time.time()
-                    tasks = []
-                    async with lock:
-                        for v in viewers.values():
-                            tasks.append(safe_send(v, data))
+                        viewers_list = list(viewers.values())
+                    
+                    tasks = [safe_send(v, data) for v in viewers_list]
                     if tasks:
                         await asyncio.gather(*tasks)
         except:
@@ -123,21 +137,14 @@ async def ws(websocket: WebSocket):
                     clients.pop(hwid, None)
                     client_last_ping.pop(hwid, None)
                     client_info.pop(hwid, None)
-                msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
-                tasks = []
-                async with lock:
-                    for v in viewers.values():
-                        tasks.append(safe_send(v, msg))
-                if tasks:
-                    await asyncio.gather(*tasks)
+                await notify_disconnect(hwid)
             
     elif role == "viewer":
         async with lock:
             viewers[vid] = websocket
-        # Отправляем существующие info
-        info_list = []
-        async with lock:
             info_list = list(client_info.values())
+            
+        # Отправляем существующие info новому вьюверу
         for info_data in info_list:
             try:
                 await websocket.send_bytes(info_data)
@@ -149,7 +156,6 @@ async def ws(websocket: WebSocket):
                 try:
                     msg = json.loads(data.decode())
                     if msg.get("type") == "get_clients":
-                        info_list = []
                         async with lock:
                             info_list = list(client_info.values())
                         for info_data in info_list:
@@ -158,6 +164,7 @@ async def ws(websocket: WebSocket):
                             except:
                                 break
                         continue
+                    
                     target_hwid = msg.get("target")
                     if target_hwid:
                         target_ws = None
@@ -168,9 +175,12 @@ async def ws(websocket: WebSocket):
                                 del msg["target"]
                                 await target_ws.send_bytes(json.dumps(msg).encode())
                             except:
+                                # ИСПРАВЛЕНО: Полная очистка состояния упавшего клиента, а не только из `clients`
                                 async with lock:
-                                    if target_hwid in clients:
-                                        del clients[target_hwid]
+                                    clients.pop(target_hwid, None)
+                                    client_last_ping.pop(target_hwid, None)
+                                    client_info.pop(target_hwid, None)
+                                await notify_disconnect(target_hwid)
                 except:
                     pass
         except:
