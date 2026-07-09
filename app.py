@@ -101,6 +101,10 @@ async def ws(websocket: WebSocket):
                         # Обработка ping
                         if msg.get("type") == "ping":
                             await websocket.send_bytes(json.dumps({"type": "pong"}).encode())
+                            # ИСПРАВЛЕНИЕ: обновляем время последнего пинга для клиента
+                            if hwid:
+                                async with lock:
+                                    client_last_ping[hwid] = time.time()
                             continue
                         
                         if msg.get("type") == "info":
