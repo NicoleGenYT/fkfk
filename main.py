@@ -93,6 +93,11 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/test")
+async def test():
+    return {"msg": "test ok"}
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     await websocket.accept()
